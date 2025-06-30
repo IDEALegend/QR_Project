@@ -1,0 +1,28 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+
+# Database
+*.sqlite3
+site.db
+
+# Flask cache & logs
+instance/
+*.log
+
+# Static build files
+static/qr/*.png
+static/qr/qr_json/*.json
+
+# System
+.DS_Store
+Thumbs.db

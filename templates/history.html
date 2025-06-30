@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Scan History</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: #111;
+            color: #fff;
+        }
+        .scan-card {
+            background: #1e1e1e;
+            margin-bottom: 15px;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 5px solid #0dcaf0;
+        }
+        .scan-card h5 {
+            margin-bottom: 0.3rem;
+        }
+    </style>
+</head>
+<body class="p-4">
+
+    <!-- ✅ Toast Message -->
+    <div class="position-fixed bottom-0 end-0 p-3" style="z-index: 9999">
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                <div class="toast show align-items-center text-bg-success border-0" role="alert">
+                    <div class="d-flex">
+                        <div class="toast-body">
+                            {{ messages[0] }}
+                        </div>
+                        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+                    </div>
+                </div>
+            {% endif %}
+        {% endwith %}
+    </div>
+
+    <h2 class="mb-4 text-center">📜 Scan History</h2>
+
+    <!-- Filter/Search -->
+    <div class="row justify-content-center g-3 mb-4">
+        <div class="col-md-6 col-sm-12">
+            <input type="text" id="search" class="form-control" placeholder="🔍 Search scanned text...">
+        </div>
+        <div class="col-md-4 col-sm-12">
+            <select id="filter-type" class="form-select">
+                <option value="">Filter by Type</option>
+                {% for t in types %}
+                    <option value="{{ t }}">{{ t }}</option>
+                {% endfor %}
+            </select>
+        </div>
+    </div>
+
+    <!-- Scanned Cards -->
+    <div id="scan-list">
+        {% for scan in scans %}
+            <div class="scan-card" data-type="{{ scan.type }}" data-text="{{ scan.data | lower }}">
+                <h5>{{ scan.type }}</h5>
+                <p class="mb-1">{{ scan.data }}</p>
+                <small style="color: #fff;">
+                    📅 {{ scan.scanned_at }}
+                    {% if scan.source == "record" %}
+                        • 📘 From record: <em>{{ scan.record_title }}</em>
+                    {% else %}
+                        • 📸 Scanned manually
+                    {% endif %}
+                </small>
+            </div>
+        {% endfor %}
+    </div>
+
+    <!-- Export & Clear Buttons -->
+    <div class="row justify-content-center g-3 mt-4">
+        <div class="col-md-auto col-sm-6 col-12">
+            <a href="/export/json" class="btn btn-outline-info w-100">⬇️ View JSON</a>
+        </div>
+        <div class="col-md-auto col-sm-6 col-12">
+            <a href="/download/csv" class="btn btn-outline-warning w-100">⬇️ Download CSV</a>
+        </div>
+        <div class="col-md-auto col-sm-6 col-12">
+            <a href="/download/json" class="btn btn-outline-light w-100">⬇️ Download JSON</a>
+        </div>
+        <div class="col-md-auto col-sm-6 col-12">
+            <form action="/clear-history" method="POST" onsubmit="return confirm('Are you sure you want to delete all scan history? This cannot be undone.')">
+                <button type="submit" class="btn btn-outline-danger w-100">🗑️ Clear History</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Navigation -->
+    <div class="d-flex justify-content-between align-items-center mt-5 flex-wrap">
+        <a href="/" class="btn btn-outline-light">⬅ Back Home</a>
+        <a href="/logout" class="btn btn-outline-danger mt-2 mt-sm-0">🚪 Logout</a>
+    </div>
+
+    <!-- JS Filtering Logic -->
+    <script>
+        const searchInput = document.getElementById('search');
+        const filterType = document.getElementById('filter-type');
+        const cards = document.querySelectorAll('.scan-card');
+
+        function filterScans() {
+            const query = searchInput.value.toLowerCase();
+            const type = filterType.value;
+            cards.forEach(card => {
+                const cardText = card.dataset.text;
+                const cardType = card.dataset.type;
+                const matchText = cardText.includes(query);
+                const matchType = !type || cardType === type;
+                card.style.display = (matchText && matchType) ? 'block' : 'none';
+            });
+        }
+
+        searchInput.addEventListener('input', filterScans);
+        filterType.addEventListener('change', filterScans);
+    </script>
+
+    <!-- ✅ Bootstrap Toast Support -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

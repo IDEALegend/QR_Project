@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Take Picture to Scan</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #111;
+            color: #fff;
+            text-align: center;
+            font-family: Arial, sans-serif;
+        }
+        #video {
+            border: 2px solid #444;
+            max-width: 100%;
+            border-radius: 8px;
+        }
+        #canvas {
+            display: none;
+        }
+        .btn-custom {
+            margin-top: 15px;
+        }
+        #snapshot-preview {
+            display: none;
+            margin-top: 20px;
+            border: 2px solid #555;
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+        }
+        .camera-container {
+            position: relative;
+            display: inline-block;
+        }
+        .status-message {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .success { background-color: #28a745; }
+        .error { background-color: #dc3545; }
+        .warning { background-color: #ffc107; color: #000; }
+    </style>
+</head>
+<body class="p-4">
+    <h2 class="mb-4">📸 Take a Picture to Scan QR/Barcode</h2>
+
+    <div class="camera-container">
+        <video id="video" width="640" height="480" autoplay playsinline></video>
+        <canvas id="canvas" width="640" height="480"></canvas>
+    </div>
+
+    <div id="status-message" class="status-message" style="display: none;"></div>
+
+    <form id="snapshot-form" method="POST" action="/capture-upload" enctype="multipart/form-data">
+        <button type="button" id="capture-btn" class="btn btn-primary btn-custom" onclick="captureImage()">
+            📷 Capture Snapshot
+        </button>
+        <button type="submit" id="upload-btn" class="btn btn-success btn-custom" disabled>
+            📤 Upload to Scan
+        </button>
+        <br>
+        <p class="text-warning small mt-2">
+            ⚠️ Max image size: 10MB. Please avoid high-res photos.
+        </p>
+        <p id="file-size-info" class="text-info mt-2">📂 Image size: --</p>
+    </form>
+
+    <!-- 📸 Preview Section -->
+    <img id="snapshot-preview" alt="Snapshot Preview" />
+
+    <a href="/scan" class="btn btn-outline-light mt-4">⬅ Back to Scan Options</a>
+
+    <script src="{{ url_for('static', filename='js/camera.js') }}"></script>
+</body>
+</html>
