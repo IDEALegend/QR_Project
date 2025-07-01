@@ -32,7 +32,6 @@
                 flex-direction: column;
                 gap: 0.5rem;
             }
-            /* Ensure list items are readable on mobile */
             .list-group-item {
                 word-wrap: break-word;
                 overflow-wrap: break-word;
@@ -52,7 +51,6 @@
             }
         }
 
-        /* Ensure image is properly responsive */
         .img-fluid {
             max-width: 100%;
             height: auto;
@@ -65,9 +63,8 @@
             }
         }
 
-        /* Ensure long data strings don't break layout */
         .list-group-item {
-            word-break: break-all;
+            word-break: break-word;
             white-space: normal;
         }
     </style>
@@ -91,7 +88,12 @@
             <h4 class="mt-4">✅ New Scan Results:</h4>
             <ul class="list-group mb-4">
                 {% for item in results %}
-                    <li class="list-group-item bg-light text-dark">{{ item.type }}: {{ item.data }}</li>
+                    <li class="list-group-item bg-light text-dark">
+                        <div class="d-flex flex-column flex-md-row justify-content-between">
+                            <strong>{{ item.type }}:</strong>
+                            <span class="ms-md-3">{{ item.data }}</span>
+                        </div>
+                    </li>
                 {% endfor %}
             </ul>
         {% else %}
@@ -101,7 +103,12 @@
         <h4>📊 Totals</h4>
         <ul class="list-group">
             {% for type, count in counts.items() %}
-                <li class="list-group-item bg-light text-dark">{{ type }}: {{ count }}</li>
+                <li class="list-group-item bg-light text-dark">
+                    <div class="d-flex flex-column flex-md-row justify-content-between">
+                        <strong>{{ type }}:</strong>
+                        <span class="ms-md-3">{{ count }}</span>
+                    </div>
+                </li>
             {% endfor %}
         </ul>
 

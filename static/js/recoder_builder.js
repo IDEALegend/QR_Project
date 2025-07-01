@@ -77,11 +77,24 @@ function fetchRecordPreview(title) {
       const preview = document.getElementById("record-preview");
       const actionButtons = document.getElementById("action-buttons");
 
-      preview.textContent = JSON.stringify(record, null, 2);
+      // Clean up escaped JSON inside "data" field
+      const cleaned = {};
+      for (const [key, value] of Object.entries(record)) {
+        const entry = { ...value };
+        try {
+          const parsed = JSON.parse(entry.data);
+          entry.data = parsed; // Replace string with parsed object
+        } catch {
+          // If not JSON, keep original string
+        }
+        cleaned[key] = entry;
+      }
+
+      preview.textContent = JSON.stringify(cleaned, null, 2);
       container.classList.remove("d-none");
 
       if (actionButtons) {
-        actionButtons.classList.remove("d-none"); // ✅ Show download button
+        actionButtons.classList.remove("d-none");
       }
     })
     .catch(err => {

@@ -850,7 +850,6 @@ def preview_record():
     if not title:
         return jsonify({"error": "Title is required"}), 400
 
-    # Get current user
     username = session.get("username")
     if not username:
         return jsonify({"error": "User not authenticated"}), 401
@@ -859,18 +858,39 @@ def preview_record():
     if not user:
         return jsonify({"error": "User not found"}), 401
 
-    # Get record
     record = Record.query.filter_by(user_id=user.id, title=title).first()
     if not record:
         return jsonify({"record": {}})
 
-    # Get all scans for this record
     scans = RecordScan.query.filter_by(record_id=record.id).all()
     record_data = {}
 
+    label_keys = ["name", "full_name", "title", "username"]
+
     for scan in scans:
-        key = f"{scan.type}:{scan.data}"
-        record_data[key] = scan.to_dict()
+        raw_data = scan.data
+        cleaned_data = raw_data
+        label = "unknown"  # default fallback
+
+        try:
+            parsed = json.loads(raw_data)
+            if isinstance(parsed, dict):
+                cleaned_data = json.dumps(parsed, separators=(",", ":"))
+                for key_option in label_keys:
+                    if key_option in parsed and parsed[key_option].strip():
+                        label = parsed[key_option].strip().lower()
+                        break
+        except:
+            if raw_data.strip().lower().startswith("http"):
+                label = "link"
+
+        key = f"{scan.type}:{label}"
+        record_data[key] = {
+            "data": cleaned_data,
+            "id": scan.id,
+            "scanned_at": scan.scanned_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": scan.type
+        }
 
     return jsonify(record_data)
 
@@ -969,7 +989,6 @@ def update_subtitle():
 
     return redirect(url_for("record_dashboard"))
 
-
 @app.route("/download-record")
 @login_required
 def download_record():
@@ -989,21 +1008,42 @@ def download_record():
     if not record:
         return f"Record '{title}' not found", 404
 
-    # Get all scans for this record
     scans = RecordScan.query.filter_by(record_id=record.id).order_by(desc(RecordScan.scanned_at)).all()
+
+    seen = set()
+    rows = []
+    all_keys = set(["id", "scanned at"])
+
+    for scan in scans:
+        row = {}
+        try:
+            raw = eval(scan.data) if isinstance(scan.data, str) else scan.data
+            if isinstance(raw, dict):
+                row = {k.strip().lower(): v.strip().lower() for k, v in raw.items()}
+            else:
+                row = {"data": str(scan.data).strip().lower()}
+        except:
+            row = {"data": str(scan.data).strip().lower()}
+
+        identity_key = tuple(sorted(row.items()))
+        if identity_key in seen:
+            continue
+        seen.add(identity_key)
+
+        row["id"] = scan.id
+        row["scanned at"] = scan.scanned_at.strftime("%Y-%m-%d %H:%M:%S")
+
+        all_keys.update(row.keys())
+        rows.append(row)
+
+    sorted_keys = sorted(all_keys)
 
     if format == "csv":
         output = StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["Type", "Data", "Scanned At"])
-
-        for scan in scans:
-            writer.writerow([
-                scan.type,
-                scan.data,
-                scan.scanned_at.strftime("%Y-%m-%d %H:%M:%S")
-            ])
-
+        writer = csv.DictWriter(output, fieldnames=sorted_keys)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in sorted_keys})
         output.seek(0)
         return send_file(
             BytesIO(output.getvalue().encode("utf-8")),
@@ -1013,8 +1053,7 @@ def download_record():
         )
 
     elif format == "excel":
-        scan_data = [scan.to_dict() for scan in scans]
-        df = pd.DataFrame(scan_data)
+        df = pd.DataFrame([{k: row.get(k, "") for k in sorted_keys} for row in rows])
         output = BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             df.to_excel(writer, index=False, sheet_name="Record")
@@ -1400,4 +1439,4 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=port, debug=True)
 
     # Locally work online work
-    # from development on site no
+    # from development on site no, hi I am ID
