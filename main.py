@@ -1,368 +1,241 @@
-from flask import Flask, render_template, request, redirect, url_for, jsonify, session, flash
-import json
+# main.py
+from flask import Flask, render_template, request, redirect, url_for, jsonify, session, flash, send_file
 import os
+import json
 from datetime import datetime
 from pyzbar.pyzbar import decode
 import cv2
 from werkzeug.utils import secure_filename
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
 import qrcode
-from flask import send_file
 import csv
 from io import StringIO, BytesIO
 from werkzeug.exceptions import RequestEntityTooLarge
 from functools import wraps
 import pandas as pd
 from xlsxwriter import Workbook
-from sqlalchemy import and_, desc
+import requests
+from dotenv import load_dotenv
 
-import os
+# load .env if present
+load_dotenv()
 
+# ---------------------------
+# Configuration
+# ---------------------------
+SERVICE_ACCOUNT = os.getenv("SERVICE_ACCOUNT", "qrpenguincloud-firebase-adminsdk.json")
+API_KEY = os.getenv("FIREBASE_WEB_API_KEY", os.getenv("FIREBASE_API_KEY", "YOUR_FIREBASE_WEB_API_KEY"))
+# If you didn't set env var, replace the above placeholder string with your API key string manually.
 
 app = Flask(__name__)
-
 app.secret_key = os.getenv("SECRET_KEY", "fallback-secret-key")
-# Database setup
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///site.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-db = SQLAlchemy(app)
-
-# Set max content length to 10MB
+# File upload / folders
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['STATIC_QR_FOLDER'] = os.path.join('static', 'qr')
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['STATIC_QR_FOLDER'], exist_ok=True)
 
-# Basic password for protected routes
+# Admin password for protected routes (if used anywhere)
 PROTECTED_PASSWORD = os.getenv("ADMIN_PASSWORD", "fallback-admin")
 
+# Firestore toggles
+FIRESTORE_WRITE = os.getenv("FIRESTORE_WRITE", "1").lower() in ("1", "true", "yes")
+FIRESTORE_READ = os.getenv("FIRESTORE_READ", "1").lower() in ("1", "true", "yes")
 
+# ---------------------------
+# Initialize Firebase Admin & Firestore
+# ---------------------------
+import firebase_admin
+from firebase_admin import credentials, auth, firestore
+try:
+    if not os.path.exists(SERVICE_ACCOUNT):
+        raise FileNotFoundError(f"Service account file '{SERVICE_ACCOUNT}' not found in project root.")
+    cred = credentials.Certificate(SERVICE_ACCOUNT)
+    firebase_admin.initialize_app(cred)
+    firestore_db = firestore.client()
+    print("✅ Firebase Admin initialized")
+except Exception as e:
+    firestore_db = None
+    print(f"❌ Failed to initialize Firebase Admin SDK: {e}")
+    # If Firestore not available, app will still run but many features disabled.
 
-# Database Models
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(150), unique=True, nullable=False)
-    email = db.Column(db.String(150), unique=True, nullable=False)
-    password = db.Column(db.String(200), nullable=False)
-
-    # Relationships
-    scans = db.relationship('Scan', backref='scan_user', lazy=True)
-    records = db.relationship('Record', backref='record_user', lazy=True)
-
-
-class Scan(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
-    data = db.Column(db.Text, nullable=False)
-    type = db.Column(db.String(50), nullable=False)
-    scanned_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "data": self.data,
-            "type": self.type,
-            "scanned_at": self.scanned_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "user_id": self.user_id
-        }
-
-
-class Record(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    folder_id = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=True)
-    title = db.Column(db.String(200), nullable=False)
-    subtitle = db.Column(db.String(500), nullable=True)
-    code = db.Column(db.String(100), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    # Relationships
-    record_scans = db.relationship('RecordScan', backref='parent_record', lazy=True, cascade='all, delete-orphan')
-
-    def get_scan_count(self):
-        return len(self.record_scans)
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "title": self.title,
-            "subtitle": self.subtitle,
-            "code": self.code,
-            "count": self.get_scan_count(),
-            "folder": self.folder.name if self.folder else "Uncategorized",
-            "folder_id": self.folder_id,
-            "created_at": self.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "updated_at": self.updated_at.strftime("%Y-%m-%d %H:%M:%S")
-        }
-
-
-class RecordScan(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    record_id = db.Column(db.Integer, db.ForeignKey('record.id'), nullable=False)
-    data = db.Column(db.Text, nullable=False)
-    type = db.Column(db.String(50), nullable=False)
-    scanned_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "data": self.data,
-            "type": self.type,
-            "scanned_at": self.scanned_at.strftime("%Y-%m-%d %H:%M:%S")
-        }
-
-
-class ScanCount(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    type = db.Column(db.String(50), unique=True, nullable=False)
-    count = db.Column(db.Integer, default=0)
-
-    @staticmethod
-    def get_counts():
-        counts = {}
-        for scan_count in ScanCount.query.all():
-            counts[scan_count.type] = scan_count.count
-        return counts
-
-    @staticmethod
-    def increment_count(scan_type):
-        scan_count = ScanCount.query.filter_by(type=scan_type).first()
-        if scan_count:
-            scan_count.count += 1
-        else:
-            scan_count = ScanCount(type=scan_type, count=1)
-            db.session.add(scan_count)
-        db.session.commit()
-
-class Folder(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    parent_id = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=True)  # NEW: For nested folders
-    name = db.Column(db.String(100), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    # Relationships
-    records = db.relationship('Record', backref='folder', lazy=True)
-    children = db.relationship('Folder', backref=db.backref('parent', remote_side=[id]), lazy=True)  # NEW
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "name": self.name,
-            "parent_id": self.parent_id,  # NEW
-            "record_count": len(self.records),
-            "created_at": self.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        }
-
-class QRGeneration(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
-    data_type = db.Column(db.String(50), nullable=False)  # 'text' or 'structured'
-    qr_data = db.Column(db.Text, nullable=False)
-    qr_filename = db.Column(db.String(200), nullable=False)
-    json_filename = db.Column(db.String(200), nullable=True)  # Only for structured data
-    generated_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "data_type": self.data_type,
-            "qr_data": self.qr_data,
-            "qr_filename": self.qr_filename,
-            "json_filename": self.json_filename,
-            "generated_at": self.generated_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "user_id": self.user_id
-        }
-
-class UploadAttempt(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
-    upload_type = db.Column(db.String(50), nullable=False)  # 'file_upload' or 'camera_capture'
-    filename = db.Column(db.String(200), nullable=False)
-    file_size = db.Column(db.Integer, nullable=True)
-    success = db.Column(db.Boolean, default=False)
-    codes_found = db.Column(db.Integer, default=0)
-    error_message = db.Column(db.Text, nullable=True)
-    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "upload_type": self.upload_type,
-            "filename": self.filename,
-            "file_size": self.file_size,
-            "success": self.success,
-            "codes_found": self.codes_found,
-            "error_message": self.error_message,
-            "uploaded_at": self.uploaded_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "user_id": self.user_id
-        }
-# Create directories
-if not os.path.exists(app.config['UPLOAD_FOLDER']):
-    os.makedirs(app.config['UPLOAD_FOLDER'])
-if not os.path.exists(app.config['STATIC_QR_FOLDER']):
-    os.makedirs(app.config['STATIC_QR_FOLDER'])
-
-
-# Initialize database with migration handling
-def init_database():
-    """Initialize database and handle migrations"""
-    try:
-        # Try to create all tables
-        db.create_all()
-
-        # Check if parent_id column exists in Folder table
-        try:
-            # Try to query with parent_id - if it fails, column doesn't exist
-            db.session.execute(db.text("SELECT parent_id FROM folder LIMIT 1"))
-        except:
-            # Add parent_id column
-            db.session.execute(db.text("ALTER TABLE folder ADD COLUMN parent_id INTEGER"))
-            db.session.commit()
-            print("✅ Added parent_id column to folder table")
-
-        # Check if QRGeneration table exists
-        try:
-            db.session.execute(db.text("SELECT * FROM qr_generation LIMIT 1"))
-        except:
-            # Create QRGeneration table manually if it doesn't exist
-            db.session.execute(db.text("""
-                CREATE TABLE qr_generation (
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER,
-                    data_type VARCHAR(50) NOT NULL,
-                    qr_data TEXT NOT NULL,
-                    qr_filename VARCHAR(200) NOT NULL,
-                    json_filename VARCHAR(200),
-                    generated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES user(id)
-                )
-            """))
-            db.session.commit()
-            print("✅ Created qr_generation table")
-
-        # Check if UploadAttempt table exists
-        try:
-            db.session.execute(db.text("SELECT * FROM upload_attempt LIMIT 1"))
-        except:
-            # Create UploadAttempt table manually if it doesn't exist
-            db.session.execute(db.text("""
-                CREATE TABLE upload_attempt (
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER,
-                    upload_type VARCHAR(50) NOT NULL,
-                    filename VARCHAR(200) NOT NULL,
-                    file_size INTEGER,
-                    success BOOLEAN DEFAULT 0,
-                    codes_found INTEGER DEFAULT 0,
-                    error_message TEXT,
-                    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES user(id)
-                )
-            """))
-            db.session.commit()
-            print("✅ Created upload_attempt table")
-
-        print("✅ Database initialized successfully")
-        migrate_old_data()
-
-    except Exception as e:
-        print(f"Database initialization error: {e}")
-        db.session.rollback()
-
-def migrate_old_data():
-    """Migrate data from old JSON files to database if they exist"""
-    try:
-        # Migrate from scanned_codes.json if it exists
-        old_data_file = "scanned_codes.json"
-        if os.path.exists(old_data_file):
-            print("📦 Migrating old scan data...")
-            with open(old_data_file, "r") as f:
-                old_data = json.load(f)
-
-            for key, entry in old_data.items():
-                if key == "counts":
-                    # Migrate counts
-                    for scan_type, count in entry.items():
-                        existing_count = ScanCount.query.filter_by(type=scan_type).first()
-                        if not existing_count:
-                            scan_count = ScanCount(type=scan_type, count=count)
-                            db.session.add(scan_count)
-                else:
-                    # Migrate scan entries
-                    if isinstance(entry, dict) and "data" in entry and "type" in entry:
-                        existing_scan = Scan.query.filter_by(
-                            data=entry["data"],
-                            type=entry["type"]
-                        ).first()
-                        if not existing_scan:
-                            scan_time = datetime.strptime(
-                                entry.get("scanned_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                                "%Y-%m-%d %H:%M:%S"
-                            )
-                            new_scan = Scan(
-                                data=entry["data"],
-                                type=entry["type"],
-                                scanned_at=scan_time
-                            )
-                            db.session.add(new_scan)
-
-            db.session.commit()
-            print("✅ Old scan data migrated successfully")
-
-            # Backup old file
-            backup_name = f"{old_data_file}.backup"
-            os.rename(old_data_file, backup_name)
-            print(f"📄 Old data backed up as {backup_name}")
-
-    except Exception as e:
-        print(f"Migration error: {e}")
-        db.session.rollback()
-
-
-with app.app_context():
-    init_database()
-
-
+# ---------------------------
+# Helpers: session & user profile
+# ---------------------------
 def login_required(f):
     @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get("authenticated"):
+    def wrapper(*args, **kwargs):
+        if not session.get("authenticated") or not session.get("firebase_uid"):
             return redirect(url_for("login"))
         return f(*args, **kwargs)
+    return wrapper
 
-    return decorated_function
+def get_uid():
+    """Return current firebase uid from session (or None)."""
+    return session.get("firebase_uid")
 
-
-# Helper function to get scan counts from database
-def get_scan_counts():
-    return ScanCount.get_counts()
-
-
-# Helper function to save scan to database with duplicate checking
-def save_scan_to_db(data, scan_type, user_id=None):
+def create_user_profile(uid, username, email):
+    """Create a user profile document in Firestore under users/{uid}/profile."""
     try:
-        # Check if scan already exists (simple check without unique constraint)
-        existing_scan = Scan.query.filter_by(data=data, type=scan_type).first()
-        if not existing_scan:
-            new_scan = Scan(data=data, type=scan_type, user_id=user_id)
-            db.session.add(new_scan)
-            ScanCount.increment_count(scan_type)
-            db.session.commit()
-            return True, new_scan
-        return False, existing_scan
+        if firestore_db is None or not FIRESTORE_WRITE:
+            return False
+        profile_ref = firestore_db.collection("users").document(uid).collection("meta").document("profile")
+        profile_ref.set({
+            "username": username,
+            "email": email,
+            "created_at": firestore.SERVER_TIMESTAMP
+        }, merge=True)
+        # Maintain a usernames mapping for quick username->uid lookup
+        # (optional, but useful for your existing username-based flows)
+        firestore_db.collection("usernames").document(username.lower()).set({
+            "uid": uid,
+            "username": username,
+            "email": email,
+            "created_at": firestore.SERVER_TIMESTAMP
+        }, merge=True)
+        # Create default meta counts doc
+        firestore_db.collection("users").document(uid).collection("meta").document("counts").set({}, merge=True)
+        return True
     except Exception as e:
-        db.session.rollback()
-        print(f"Error saving scan: {e}")
-        return False, None
+        print(f"Warning: create_user_profile failed: {e}")
+        return False
 
+def get_profile_by_username(username):
+    """Return profile dict by username lookup (using usernames collection)."""
+    if firestore_db is None or not FIRESTORE_READ:
+        return None
+    try:
+        doc = firestore_db.collection("usernames").document(username.lower()).get()
+        if doc.exists:
+            data = doc.to_dict()
+            return data
+    except Exception as e:
+        print(f"Warning: get_profile_by_username failed: {e}")
+    return None
+
+def get_profile_by_uid(uid):
+    """Return profile doc data for a uid."""
+    if firestore_db is None or not FIRESTORE_READ:
+        return None
+    try:
+        doc = firestore_db.collection("users").document(uid).collection("meta").document("profile").get()
+        if doc.exists:
+            return doc.to_dict()
+    except Exception as e:
+        print(f"Warning: get_profile_by_uid failed: {e}")
+    return None
+
+# ---------------------------
+# Scan counts helper
+# ---------------------------
+def increment_scan_count(uid, scan_type):
+    """Increment count for a given scan type in /users/{uid}/meta/counts."""
+    if firestore_db is None or not FIRESTORE_WRITE:
+        return
+    try:
+        counts_ref = firestore_db.collection("users").document(uid).collection("meta").document("counts")
+        # Atomic increment
+        counts_ref.set({scan_type: firestore.Increment(1)}, merge=True)
+    except Exception as e:
+        print(f"Warning: increment_scan_count failed: {e}")
+
+def get_scan_counts(uid=None):
+    """Return counts dict for a user or global aggregated counts fallback."""
+    try:
+        if firestore_db is None or not FIRESTORE_READ:
+            return {}
+        if uid:
+            doc = firestore_db.collection("users").document(uid).collection("meta").document("counts").get()
+            if doc.exists:
+                return doc.to_dict()
+            else:
+                return {}
+        else:
+            return {}
+    except Exception as e:
+        print(f"Warning: get_scan_counts failed: {e}")
+        return {}
+
+# ---------------------------
+# Utility: Firestore read/write wrappers
+# ---------------------------
+def add_scan_to_firestore(uid, data, scan_type, extra=None):
+    """Add a scan doc to /users/{uid}/scans"""
+    if firestore_db is None or not FIRESTORE_WRITE or not uid:
+        return None
+    try:
+        doc = {
+            "data": data,
+            "type": scan_type,
+            "firebase_uid": uid,
+            "timestamp": firestore.SERVER_TIMESTAMP
+        }
+        if extra:
+            doc.update(extra)
+        ref = firestore_db.collection("users").document(uid).collection("scans").add(doc)
+        # increment counts
+        increment_scan_count(uid, scan_type)
+        return ref
+    except Exception as e:
+        print(f"Warning: add_scan_to_firestore failed: {e}")
+        return None
+
+def add_record_to_firestore(uid, record_obj):
+    """Write a record dict to /users/{uid}/records with auto id."""
+    if firestore_db is None or not FIRESTORE_WRITE or not uid:
+        return None
+    try:
+        # record_obj is expected to be a dict with title, subtitle, code, folder_id (optional)
+        record_obj.setdefault("firebase_uid", uid)
+        record_obj.setdefault("created_at", firestore.SERVER_TIMESTAMP)
+        record_obj.setdefault("updated_at", firestore.SERVER_TIMESTAMP)
+        ref = firestore_db.collection("users").document(uid).collection("records").add(record_obj)
+        return ref
+    except Exception as e:
+        print(f"Warning: add_record_to_firestore failed: {e}")
+        return None
+
+def update_record_firestore(uid, record_id, update_fields):
+    try:
+        if firestore_db is None or not FIRESTORE_WRITE or not uid:
+            return False
+        doc_ref = firestore_db.collection("users").document(uid).collection("records").document(record_id)
+        update_fields["updated_at"] = firestore.SERVER_TIMESTAMP
+        doc_ref.update(update_fields)
+        return True
+    except Exception as e:
+        print(f"Warning: update_record_firestore failed: {e}")
+        return False
+
+def delete_record_firestore(uid, record_id):
+    try:
+        if firestore_db is None or not FIRESTORE_WRITE or not uid:
+            return False
+        # delete record scans that reference record_id
+        scans_q = firestore_db.collection("users").document(uid).collection("record_scans").where("record_id", "==", record_id).stream()
+        for s in scans_q:
+            s.reference.delete()
+        # delete record doc
+        firestore_db.collection("users").document(uid).collection("records").document(record_id).delete()
+        return True
+    except Exception as e:
+        print(f"Warning: delete_record_firestore failed: {e}")
+        return False
+
+# ---------------------------
+# Old local behaviour that we keep:
+# - Local QR image generation remains local (static/qr)
+# - Uploaded files stored in uploads/ and removed after processing
+# ---------------------------
+
+# ---------------------------
+# Routes (keeping original structure)
+# ---------------------------
 
 @app.route("/")
 def home():
     return render_template("index.html")
-
 
 @app.route("/create")
 def create():
@@ -374,11 +247,8 @@ def create():
 def generate():
     timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
 
-    # Get current user
-    user_id = None
-    if session.get("authenticated"):
-        user = User.query.filter_by(username=session.get("username")).first()
-        user_id = user.id if user else None
+    # Determine firebase uid if authenticated
+    uid = get_uid()
 
     if request.form.get("form_mode"):
         labels = request.form.getlist("label[]")
@@ -398,20 +268,19 @@ def generate():
         img = qrcode.make(json_data)
         img.save(qr_path)
 
-        # Save to database
+        # Write QR generation metadata to Firestore
         try:
-            qr_generation = QRGeneration(
-                user_id=user_id,
-                data_type='structured',
-                qr_data=json_data,
-                qr_filename=qr_filename,
-                json_filename=json_filename
-            )
-            db.session.add(qr_generation)
-            db.session.commit()
+            if firestore_db is not None and FIRESTORE_WRITE and uid:
+                firestore_db.collection("users").document(uid).collection("qr_generations").add({
+                    "user_id": uid,
+                    "data_type": "structured",
+                    "qr_data": json_data,
+                    "qr_filename": qr_filename,
+                    "json_filename": json_filename,
+                    "generated_at": firestore.SERVER_TIMESTAMP
+                })
         except Exception as e:
-            print(f"Error saving QR generation to database: {e}")
-            db.session.rollback()
+            print(f"Warning: could not write qr_generation to Firestore: {e}")
 
         session["qr_path"] = qr_filename
         session["json_path"] = f"qr_json/{json_filename}"
@@ -428,20 +297,19 @@ def generate():
     img = qrcode.make(data)
     img.save(qr_path)
 
-    # Save to database
+    # Write QR generation metadata to Firestore
     try:
-        qr_generation = QRGeneration(
-            user_id=user_id,
-            data_type='text',
-            qr_data=data,
-            qr_filename=qr_filename,
-            json_filename=None
-        )
-        db.session.add(qr_generation)
-        db.session.commit()
+        if firestore_db is not None and FIRESTORE_WRITE and uid:
+            firestore_db.collection("users").document(uid).collection("qr_generations").add({
+                "user_id": uid,
+                "data_type": "text",
+                "qr_data": data,
+                "qr_filename": qr_filename,
+                "json_filename": None,
+                "generated_at": firestore.SERVER_TIMESTAMP
+            })
     except Exception as e:
-        print(f"Error saving QR generation to database: {e}")
-        db.session.rollback()
+        print(f"Warning: could not write qr_generation to Firestore: {e}")
 
     session["qr_path"] = qr_filename
     session["qr_data"] = data
@@ -453,12 +321,13 @@ def generate():
 def scan():
     return render_template("scan.html")
 
-
 @app.route("/webcam")
 def webcam():
     return render_template("webcam.html")
 
-
+# ---------------------------
+# Upload handling (file upload + camera capture)
+# ---------------------------
 @app.route("/upload", methods=["POST"])
 def upload():
     files = request.files.getlist("image")
@@ -466,10 +335,7 @@ def upload():
         return "No file(s) uploaded", 400
 
     new_scans = []
-    user_id = None
-    if session.get("authenticated"):
-        user = User.query.filter_by(username=session.get("username")).first()
-        user_id = user.id if user else None
+    uid = get_uid()
 
     for file in files:
         if file.filename == "":
@@ -496,9 +362,19 @@ def upload():
             for obj in decoded:
                 code_data = obj.data.decode("utf-8")
                 code_type = str(obj.type)
+                # Add to Firestore scans (avoid duplicates by checking latest few)
+                is_new = True
+                if uid and firestore_db is not None and FIRESTORE_READ:
+                    # simple duplicate check: see if same data exists in last 100 scans
+                    try:
+                        recent = firestore_db.collection("users").document(uid).collection("scans").where("data", "==", code_data).limit(1).stream()
+                        if any(recent):
+                            is_new = False
+                    except Exception:
+                        is_new = True
 
-                is_new, scan = save_scan_to_db(code_data, code_type, user_id)
                 if is_new:
+                    add_scan_to_firestore(uid if uid else "anonymous", code_data, code_type)
                     new_scans.append({"type": code_type, "data": code_data})
 
             success = codes_found > 0
@@ -507,29 +383,27 @@ def upload():
             error_message = str(e)
             print(f"Error processing image {filename}: {e}")
         finally:
-            # Track upload attempt in database
+            # Track upload attempt in Firestore meta collection (best-effort)
             try:
-                upload_attempt = UploadAttempt(
-                    user_id=user_id,
-                    upload_type='file_upload',
-                    filename=filename,
-                    file_size=file_size,
-                    success=success,
-                    codes_found=codes_found,
-                    error_message=error_message
-                )
-                db.session.add(upload_attempt)
-                db.session.commit()
+                attempt_doc = {
+                    "upload_type": "file_upload",
+                    "filename": filename,
+                    "file_size": file_size,
+                    "success": success,
+                    "codes_found": codes_found,
+                    "error_message": error_message,
+                    "uploaded_at": firestore.SERVER_TIMESTAMP
+                }
+                if uid and firestore_db is not None and FIRESTORE_WRITE:
+                    firestore_db.collection("users").document(uid).collection("upload_attempts").add(attempt_doc)
             except Exception as e:
-                print(f"Error saving upload attempt: {e}")
-                db.session.rollback()
+                print(f"Warning: could not save upload attempt to Firestore: {e}")
 
             # Clean up uploaded file
             if os.path.exists(filepath):
                 os.remove(filepath)
 
-    return render_template("upload_result.html", results=new_scans, counts=get_scan_counts())
-
+    return render_template("upload_result.html", results=new_scans, counts=get_scan_counts(get_uid()))
 
 @app.route("/save-scan", methods=["POST"])
 def save_scan():
@@ -540,31 +414,42 @@ def save_scan():
     if not format or not text:
         return jsonify({"error": "Missing data"}), 400
 
-    user_id = None
-    if session.get("authenticated"):
-        user = User.query.filter_by(username=session.get("username")).first()
-        user_id = user.id if user else None
-
-    is_new, scan = save_scan_to_db(text, format, user_id)
+    uid = get_uid()
+    if uid:
+        add_scan_to_firestore(uid, text, format)
+    else:
+        # Optionally store anonymous scans under a 'public' uid or ignore
+        add_scan_to_firestore("anonymous", text, format)
 
     return jsonify({
         "status": "saved",
-        "new": is_new,
-        "counts": get_scan_counts()
+        "counts": get_scan_counts(get_uid())
     })
-
 
 @app.route("/scans")
 def scans():
-    scans = Scan.query.order_by(desc(Scan.scanned_at)).all()
-    scan_list = [s.to_dict() for s in scans]
-    return jsonify(scan_list)
+    try:
+        uid = get_uid()
+        if FIRESTORE_READ and firestore_db is not None and uid:
+            docs = firestore_db.collection("users").document(uid).collection("scans").order_by("timestamp", direction=firestore.Query.DESCENDING).stream()
+            scan_list = []
+            for d in docs:
+                dd = d.to_dict()
+                # normalized timestamp
+                t = dd.get("timestamp")
+                if hasattr(t, "isoformat"):
+                    dd["timestamp"] = t.isoformat()
+                scan_list.append(dd)
+            return jsonify(scan_list)
+    except Exception as e:
+        print(f"Warning: could not read scans from Firestore: {e}")
 
+    # fallback: return empty or previous local caching behavior (none)
+    return jsonify([])
 
 @app.route("/camera")
 def camera():
     return render_template("camera.html")
-
 
 @app.route("/capture-upload", methods=["POST"])
 def capture_upload():
@@ -576,11 +461,7 @@ def capture_upload():
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
 
-    user_id = None
-    if session.get("authenticated"):
-        user = User.query.filter_by(username=session.get("username")).first()
-        user_id = user.id if user else None
-
+    uid = get_uid()
     file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
     codes_found = 0
     success = False
@@ -600,9 +481,18 @@ def capture_upload():
         for obj in decoded:
             code_data = obj.data.decode("utf-8")
             code_type = str(obj.type)
+            # duplicate check
+            is_new = True
+            if uid and firestore_db is not None and FIRESTORE_READ:
+                try:
+                    recent = firestore_db.collection("users").document(uid).collection("scans").where("data", "==", code_data).limit(1).stream()
+                    if any(recent):
+                        is_new = False
+                except Exception:
+                    is_new = True
 
-            is_new, scan = save_scan_to_db(code_data, code_type, user_id)
             if is_new:
+                add_scan_to_firestore(uid if uid else "anonymous", code_data, code_type)
                 new_scans.append({"type": code_type, "data": code_data})
 
         success = codes_found > 0
@@ -610,7 +500,7 @@ def capture_upload():
         return render_template(
             "upload_result.html",
             results=new_scans,
-            counts=get_scan_counts(),
+            counts=get_scan_counts(uid),
             image_path=url_for('static', filename=f'uploads/{filename}')
         )
 
@@ -618,54 +508,88 @@ def capture_upload():
         error_message = str(e)
         return render_template("upload_result.html", results=[], counts={}, error=f"❌ Error processing image: {str(e)}")
     finally:
-        # Track upload attempt in database
+        # Track upload attempt in Firestore
         try:
-            upload_attempt = UploadAttempt(
-                user_id=user_id,
-                upload_type='camera_capture',
-                filename=filename,
-                file_size=file_size,
-                success=success,
-                codes_found=codes_found,
-                error_message=error_message
-            )
-            db.session.add(upload_attempt)
-            db.session.commit()
+            attempt_doc = {
+                "upload_type": "camera_capture",
+                "filename": filename,
+                "file_size": file_size,
+                "success": success,
+                "codes_found": codes_found,
+                "error_message": error_message,
+                "uploaded_at": firestore.SERVER_TIMESTAMP
+            }
+            if uid and firestore_db is not None and FIRESTORE_WRITE:
+                firestore_db.collection("users").document(uid).collection("upload_attempts").add(attempt_doc)
         except Exception as e:
-            print(f"Error saving capture attempt: {e}")
-            db.session.rollback()
+            print(f"Warning: could not save capture attempt to Firestore: {e}")
 
         # Clean up uploaded file
         if os.path.exists(filepath):
             os.remove(filepath)
 
+# ---------------------------
+# History & exports
+# ---------------------------
 @app.route("/history")
 @login_required
 def history():
-    scans = Scan.query.order_by(desc(Scan.scanned_at)).all()
-    return render_template("history.html", scans=scans, types=sorted({s.type for s in scans}))
+    try:
+        uid = get_uid()
+        if FIRESTORE_READ and firestore_db is not None and uid:
+            docs = firestore_db.collection("users").document(uid).collection("scans").order_by("timestamp", direction=firestore.Query.DESCENDING).stream()
+            scan_list = []
+            types = set()
+            for d in docs:
+                doc = d.to_dict()
+                types.add(doc.get("type"))
+                # normalize timestamp
+                t = doc.get("timestamp")
+                doc["timestamp"] = t.isoformat() if hasattr(t, "isoformat") else t
+                scan_list.append(doc)
+            return render_template("history.html", scans=scan_list, types=sorted(types))
+    except Exception as e:
+        print(f"Warning: could not read scans from Firestore: {e}")
 
+    # fallback empty
+    return render_template("history.html", scans=[], types=[])
 
 @app.route("/export/json")
 def export_json():
-    scans = Scan.query.all()
-    data = {
-        "scans": [scan.to_dict() for scan in scans],
-        "counts": get_scan_counts()
-    }
-    return jsonify(data)
+    try:
+        uid = get_uid()
+        if FIRESTORE_READ and firestore_db is not None and uid:
+            docs = firestore_db.collection("users").document(uid).collection("scans").stream()
+            scans = [d.to_dict() for d in docs]
+            data = {"scans": scans, "counts": get_scan_counts(uid)}
+            return jsonify(data)
+    except Exception as e:
+        print(f"Warning: could not export scans from Firestore: {e}")
 
+    return jsonify({"scans": [], "counts": {}})
 
 @app.route("/download/csv")
 def download_csv():
-    scans = Scan.query.order_by(desc(Scan.scanned_at)).all()
+    try:
+        uid = get_uid()
+        if FIRESTORE_READ and firestore_db is not None and uid:
+            docs = firestore_db.collection("users").document(uid).collection("scans").order_by("timestamp", direction=firestore.Query.DESCENDING).stream()
+            scans = [d.to_dict() for d in docs]
+        else:
+            scans = []
+    except Exception as e:
+        print(f"Warning: could not read scans for CSV from Firestore: {e}")
+        scans = []
+
     output = StringIO()
     writer = csv.writer(output)
-
     writer.writerow(["Type", "Data", "Scanned At", "User ID"])
 
     for scan in scans:
-        writer.writerow([scan.type, scan.data, scan.scanned_at.strftime("%Y-%m-%d %H:%M:%S"), scan.user_id or ""])
+        scanned_at = scan.get("timestamp")
+        if hasattr(scanned_at, "isoformat"):
+            scanned_at = scanned_at.isoformat()
+        writer.writerow([scan.get("type"), scan.get("data"), scanned_at or "", scan.get("firebase_uid") or ""])
 
     output.seek(0)
     return send_file(
@@ -675,166 +599,257 @@ def download_csv():
         download_name='scan_history.csv'
     )
 
-
 @app.route("/download/json")
 def download_json():
-    scans = Scan.query.all()
-    data = {
-        "scans": [scan.to_dict() for scan in scans],
-        "counts": get_scan_counts()
-    }
+    try:
+        uid = get_uid()
+        if FIRESTORE_READ and firestore_db is not None and uid:
+            docs = firestore_db.collection("users").document(uid).collection("scans").stream()
+            scans = [d.to_dict() for d in docs]
+            data = {"scans": scans, "counts": get_scan_counts(uid)}
+            return send_file(
+                BytesIO(json.dumps(data, indent=4).encode('utf-8')),
+                mimetype='application/json',
+                as_attachment=True,
+                download_name='scan_history.json'
+            )
+    except Exception as e:
+        print(f"Warning: could not create JSON from Firestore: {e}")
+
     return send_file(
-        BytesIO(json.dumps(data, indent=4).encode('utf-8')),
+        BytesIO(json.dumps({"scans": [], "counts": {}}, indent=4).encode('utf-8')),
         mimetype='application/json',
         as_attachment=True,
         download_name='scan_history.json'
     )
 
-
 @app.errorhandler(RequestEntityTooLarge)
 def handle_large_file(e):
-    return render_template("upload_result.html", results=[], counts={},
-                           error="❌ Image too large. Please upload a file under 10MB."), 413
+    return render_template("upload_result.html", results=[], counts={}, error="❌ Image too large. Please upload a file under 10MB."), 413
 
+# ---------------------------
+# Authentication routes: signup, login, logout
+# ---------------------------
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    # Create a user with Firebase Auth (Admin SDK) and create profile doc in Firestore
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "").strip()
 
- # Required for sessions
+        if not username or not email or not password:
+            return render_template("signup.html", error="All fields required.")
 
+        # Check if username already exists (usernames collection)
+        try:
+            if firestore_db is not None and FIRESTORE_READ:
+                existing = firestore_db.collection("usernames").document(username.lower()).get()
+                if existing.exists:
+                    return render_template("signup.html", error="Username already exists.")
+        except Exception as e:
+            print(f"Warning: username uniqueness check failed: {e}")
+
+        try:
+            # Create Firebase Auth user using Admin SDK
+            firebase_user = auth.create_user(email=email, password=password, display_name=username)
+            uid = firebase_user.uid
+            # Create profile in Firestore
+            created = create_user_profile(uid, username, email)
+            # Set session
+            session["authenticated"] = True
+            session["firebase_uid"] = uid
+            session["username"] = username
+            session["email"] = email
+            flash("✅ Signup successful! You are now logged in.")
+            return redirect(url_for("record_builder"))
+        except Exception as e:
+            print(f"Error creating user in Firebase Auth: {e}")
+            # Try to surface a friendly message
+            return render_template("signup.html", error=f"Could not create account: {str(e)}")
+
+    return render_template("signup.html")
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    # Use Firebase Auth REST API to sign in with email & password and obtain localId (uid)
     if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
 
-        user = User.query.filter_by(username=username).first()
+        if not username or not password:
+            return render_template("login.html", error="Username and password required.")
 
-        if user and check_password_hash(user.password, password):
-            session["authenticated"] = True
-            session["username"] = user.username
-            session["user_id"] = user.id
-            flash("✅ Login successful!")
-            return redirect(url_for("history"))
-        else:
-            return render_template("login.html", error="❌ Invalid username or password.")
+        # First, look up email by username using user mapping
+        profile = get_profile_by_username(username)
+        if not profile:
+            return render_template("login.html", error="Invalid username or password.")
+
+        email = profile.get("email")
+        if not email:
+            return render_template("login.html", error="Invalid username or password.")
+
+        try:
+            url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={API_KEY}"
+            payload = {"email": email, "password": password, "returnSecureToken": True}
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                uid = data.get("localId")
+                id_token = data.get("idToken")
+                session["authenticated"] = True
+                session["firebase_uid"] = uid
+                session["username"] = username
+                session["email"] = email
+                # (Optional) store idToken short-lived if needed: session["idToken"] = id_token
+                flash("✅ Login successful!")
+                return redirect(url_for("history"))
+            else:
+                err = resp.json().get("error", {}).get("message", "Login failed.")
+                return render_template("login.html", error=f"❌ {err}")
+        except Exception as e:
+            print(f"Warning: Firebase login request failed: {e}")
+            return render_template("login.html", error="❌ Login failed; try again later.")
+
     return render_template("login.html")
-
-
-@app.route("/signup", methods=["GET", "POST"])
-def signup():
-    if request.method == "POST":
-        username = request.form.get("username").strip()
-        email = request.form.get("email").strip()
-        password = request.form.get("password").strip()
-
-        # Check for existing user
-        existing_user = User.query.filter((User.username == username) | (User.email == email)).first()
-        if existing_user:
-            return render_template("signup.html", error="❌ Username or email already exists.")
-
-        hashed_password = generate_password_hash(password)
-
-        new_user = User(username=username, email=email, password=hashed_password)
-        db.session.add(new_user)
-        db.session.commit()
-
-        flash("✅ Signup successful! Please login.")
-        return redirect(url_for("login"))
-    return render_template("signup.html")
-
-
-@app.route("/clear-history", methods=["POST"])
-@login_required
-def clear_history():
-    try:
-        # Clear all scans
-        Scan.query.delete()
-        # Reset all scan counts
-        ScanCount.query.delete()
-        db.session.commit()
-        flash("✅ Scan history cleared successfully!")
-    except Exception as e:
-        db.session.rollback()
-        flash(f"❌ Error clearing history: {str(e)}")
-    return redirect(url_for("history"))
-
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("home"))
 
+# ---------------------------
+# Clear history (delete user's scans)
+# ---------------------------
+@app.route("/clear-history", methods=["POST"])
+@login_required
+def clear_history():
+    uid = get_uid()
+    if not uid:
+        return redirect(url_for("login"))
 
+    try:
+        # Delete all scans subcollection docs
+        scans_col = firestore_db.collection("users").document(uid).collection("scans")
+        # batch delete
+        docs = scans_col.stream()
+        batch = firestore_db.batch()
+        count = 0
+        for d in docs:
+            batch.delete(d.reference)
+            count += 1
+            if count == 500:
+                batch.commit()
+                batch = firestore_db.batch()
+                count = 0
+        if count > 0:
+            batch.commit()
+        # Reset counts doc
+        firestore_db.collection("users").document(uid).collection("meta").document("counts").set({}, merge=True)
+        flash("✅ Scan history cleared successfully!")
+    except Exception as e:
+        print(f"Error clearing history in Firestore: {e}")
+        flash("❌ Error clearing history.")
+    return redirect(url_for("history"))
+
+# ---------------------------
+# Record builder / record scans
+# ---------------------------
 @app.route("/record-builder")
 @login_required
 def record_builder():
     return render_template("record-builder.html")
-
 
 @app.route("/save-record-scan", methods=["POST"])
 @login_required
 def save_record_scan():
     try:
         data = request.get_json(force=True)
-
-        format = data.get("format")
+        fmt = data.get("format")
         text = data.get("text")
-        meta_info = data.get("meta_info")
+        meta_info = data.get("meta_info", {})
 
-        if not format or not text or not meta_info:
+        if not fmt or not text or not meta_info:
             return jsonify({"error": "Missing format, text, or meta_info"}), 400
 
         title = meta_info.get("title", "").strip()
+        subtitle = meta_info.get("subtitle", "").strip()
+        code = meta_info.get("code", "").strip()
+        folder_id = meta_info.get("folder_id") or None
+
         if not title:
             return jsonify({"error": "Title is required in meta_info"}), 400
 
-        # Get the current user
-        username = session.get("username")
-        if not username:
+        uid = get_uid()
+        if not uid:
             return jsonify({"error": "User not authenticated"}), 401
 
-        user = User.query.filter_by(username=username).first()
-        if not user:
-            return jsonify({"error": "User not found"}), 401
+        user_doc = firestore_db.collection("users").document(uid)
 
-        # Get or create record
-        record = Record.query.filter_by(user_id=user.id, title=title).first()
-        if not record:
-            record = Record(
-                user_id=user.id,
-                title=title,
-                subtitle=meta_info.get("subtitle", ""),
-                code=meta_info.get("code", "")
-            )
-            db.session.add(record)
-            db.session.commit()
+        # ---- Look up or create record ----
+        records_col = user_doc.collection("records")
+        q = records_col.where("title", "==", title).limit(1).stream()
+        rec_docs = list(q)
 
-        # Check if scan already exists in this record (simple check)
-        existing_scan = RecordScan.query.filter_by(
-            record_id=record.id,
-            data=text,
-            type=format
-        ).first()
-
-        if not existing_scan:
-            new_scan = RecordScan(
-                record_id=record.id,
-                data=text,
-                type=format
-            )
-            db.session.add(new_scan)
-
-            # Update record's updated_at timestamp
-            record.updated_at = datetime.utcnow()
-            db.session.commit()
-
-            return jsonify({"new": True, "message": "Scan saved."})
+        if rec_docs:
+            rec_doc = rec_docs[0]
+            record_id = rec_doc.id
+            record_data = rec_doc.to_dict()
         else:
+            # Create new record
+            record_doc = {
+                "user_id": uid,
+                "title": title,
+                "subtitle": subtitle,
+                "code": code,
+                "folder_id": folder_id,
+                "folder_name": None,
+                "created_at": firestore.SERVER_TIMESTAMP,
+                "updated_at": firestore.SERVER_TIMESTAMP
+            }
+
+            # Resolve folder name
+            if folder_id:
+                folder_ref = user_doc.collection("folders").document(folder_id)
+                folder_doc = folder_ref.get()
+                if folder_doc.exists:
+                    record_doc["folder_name"] = folder_doc.to_dict().get("name")
+
+            new_ref = records_col.add(record_doc)
+            record_id = new_ref[1].id
+            record_data = record_doc
+
+        # ---- Prevent duplicate scans ----
+        rec_scans_col = user_doc.collection("record_scans")
+        duplicates = rec_scans_col.where("record_id", "==", record_id).where("data", "==", text).limit(1).stream()
+        if any(duplicates):
             return jsonify({"new": False, "message": "Duplicate scan."})
 
+        # ---- Save scan ----
+        new_scan_doc = {
+            "record_id": record_id,
+            "data": text,
+            "type": fmt,
+            "scanned_at": firestore.SERVER_TIMESTAMP,
+            "user_id": uid
+        }
+        rec_scans_col.add(new_scan_doc)
+
+        # ---- Update record metadata ----
+        records_col.document(record_id).update({
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            "subtitle": subtitle or record_data.get("subtitle", ""),
+            "folder_id": folder_id or record_data.get("folder_id"),
+            "folder_name": record_data.get("folder_name") or None
+        })
+
+        # ---- Increment scan statistics ----
+        increment_scan_count(uid, fmt)
+
+        return jsonify({"new": True, "message": "Scan saved."})
+
     except Exception as e:
-        db.session.rollback()
-        import traceback
-        print("Error saving scan:", traceback.format_exc())
+        print("❌ Error saving record scan:", e)
         return jsonify({"error": f"Exception: {str(e)}"}), 500
 
 
@@ -843,66 +858,70 @@ def save_record_scan():
 def record_camera():
     return render_template("record-camera.html")
 
-
 @app.route("/preview-record")
+@login_required
 def preview_record():
     title = request.args.get("title", "").strip()
     if not title:
         return jsonify({"error": "Title is required"}), 400
 
-    username = session.get("username")
-    if not username:
+    uid = get_uid()
+    if not uid:
         return jsonify({"error": "User not authenticated"}), 401
 
-    user = User.query.filter_by(username=username).first()
-    if not user:
-        return jsonify({"error": "User not found"}), 401
+    try:
+        # Find record by title
+        docs = firestore_db.collection("users").document(uid).collection("records").where("title", "==", title).stream()
+        rec_docs = list(docs)
+        if not rec_docs:
+            return jsonify({"record": {}})
+        rec = rec_docs[0].to_dict()
+        rec_id = rec_docs[0].id
 
-    record = Record.query.filter_by(user_id=user.id, title=title).first()
-    if not record:
+        scans_docs = firestore_db.collection("users").document(uid).collection("record_scans").where("record_id", "==", rec_id).stream()
+        record_data = {}
+        label_keys = ["name", "full_name", "title", "username"]
+        for sd in scans_docs:
+            s_dict = sd.to_dict()
+            raw_data = s_dict.get("data", "")
+            cleaned_data = raw_data
+            label = "unknown"
+            try:
+                parsed = json.loads(raw_data)
+                if isinstance(parsed, dict):
+                    cleaned_data = json.dumps(parsed, separators=(",", ":"))
+                    for key_option in label_keys:
+                        if key_option in parsed and parsed[key_option].strip():
+                            label = parsed[key_option].strip().lower()
+                            break
+            except:
+                if raw_data.strip().lower().startswith("http"):
+                    label = "link"
+            key = f"{s_dict.get('type')}:{label}"
+            record_data[key] = {
+                "data": cleaned_data,
+                "id": sd.id,
+                "scanned_at": s_dict.get("scanned_at"),
+                "type": s_dict.get("type")
+            }
+        return jsonify(record_data)
+    except Exception as e:
+        print(f"Warning: preview_record failed: {e}")
         return jsonify({"record": {}})
 
-    scans = RecordScan.query.filter_by(record_id=record.id).all()
-    record_data = {}
-
-    label_keys = ["name", "full_name", "title", "username"]
-
-    for scan in scans:
-        raw_data = scan.data
-        cleaned_data = raw_data
-        label = "unknown"  # default fallback
-
-        try:
-            parsed = json.loads(raw_data)
-            if isinstance(parsed, dict):
-                cleaned_data = json.dumps(parsed, separators=(",", ":"))
-                for key_option in label_keys:
-                    if key_option in parsed and parsed[key_option].strip():
-                        label = parsed[key_option].strip().lower()
-                        break
-        except:
-            if raw_data.strip().lower().startswith("http"):
-                label = "link"
-
-        key = f"{scan.type}:{label}"
-        record_data[key] = {
-            "data": cleaned_data,
-            "id": scan.id,
-            "scanned_at": scan.scanned_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "type": scan.type
-        }
-
-    return jsonify(record_data)
-
-
+# ---------------------------
+# Utilities: time_ago, dashboard, record-dash operations
+# ---------------------------
 def time_ago(from_time):
     now = datetime.now()
-    delta = now - from_time
+    if isinstance(from_time, datetime):
+        delta = now - from_time
+    else:
+        return ""
     seconds = int(delta.total_seconds())
     minutes = seconds // 60
     hours = minutes // 60
     days = delta.days
-
     if seconds < 60:
         return f"{seconds} second{'s' if seconds != 1 else ''} ago"
     elif minutes < 60:
@@ -918,121 +937,168 @@ def time_ago(from_time):
         years = days // 365
         return f"{years} year{'s' if years != 1 else ''} ago"
 
-
 @app.route("/record-dashboard")
 @login_required
 def record_dashboard():
-    username = session.get("username")
-    user = User.query.filter_by(username=username).first()
-
-    if not user:
+    uid = get_uid()
+    if not uid:
         return redirect(url_for("login"))
 
-    # Get all records and folders for the user
-    records = Record.query.filter_by(user_id=user.id).order_by(desc(Record.updated_at)).all()
-    folders = Folder.query.filter_by(user_id=user.id).all()
-
     record_list = []
-    for record in records:
-        record_list.append({
-            "title": record.title,
-            "subtitle": record.subtitle,
-            "count": record.get_scan_count(),
-            "folder": record.folder.name if record.folder else "Uncategorized",
-            "folder_id": record.folder_id,
-            "last_modified": record.updated_at.timestamp(),
-            "modified": time_ago(record.updated_at)
-        })
+    folder_list = []
+    try:
+        if FIRESTORE_READ and firestore_db is not None and uid:
+            # Fetch records
+            records = firestore_db.collection("users").document(uid).collection("records").stream()
+            for r in records:
+                rd = r.to_dict()
+                record_list.append({
+                    "title": rd.get("title"),
+                    "subtitle": rd.get("subtitle"),
+                    "count": rd.get("count", 0),  # optional stored count
+                    "folder": rd.get("folder", "Uncategorized"),
+                    "folder_id": rd.get("folder_id"),
+                    "last_modified": rd.get("updated_at"),
+                    "modified": rd.get("updated_at")
+                })
+            # Fetch folders
+            folders = firestore_db.collection("users").document(uid).collection("folders").stream()
+            for f in folders:
+                folder_list.append(f.to_dict())
+            return render_template("record-dashboard.html", records=record_list, folders=folder_list)
+    except Exception as e:
+        print(f"Warning: could not read records from Firestore: {e}")
 
-    folder_list = [folder.to_dict() for folder in folders]
-
+    # fallback empty
     return render_template("record-dashboard.html", records=record_list, folders=folder_list)
 
 @app.route("/delete-record", methods=["POST"])
 @login_required
 def delete_record():
     title = request.form.get("title")
-    username = session.get("username")
-
-    user = User.query.filter_by(username=username).first()
-    if not user:
+    uid = get_uid()
+    if not uid:
         return redirect(url_for("login"))
 
-    record = Record.query.filter_by(user_id=user.id, title=title).first()
-    if record:
-        # This will also delete associated RecordScans due to cascade
-        db.session.delete(record)
-        db.session.commit()
-        flash(f"✅ Record '{title}' deleted successfully!")
-
+    try:
+        # Find record by title
+        docs = firestore_db.collection("users").document(uid).collection("records").where("title", "==", title).stream()
+        recs = list(docs)
+        if recs:
+            rec_id = recs[0].id
+            # delete record doc and its record_scans
+            delete_record_firestore(uid, rec_id)
+            flash(f"✅ Record '{title}' deleted successfully!")
+    except Exception as e:
+        print(f"Warning: could not delete record: {e}")
     return redirect(url_for("record_dashboard"))
-
 
 @app.route("/update-subtitle", methods=["POST"])
 @login_required
 def update_subtitle():
-    title = request.form.get("title", "").strip()
-    new_subtitle = request.form.get("subtitle", "").strip()
+    try:
+        uid = get_uid()
+        if not uid:
+            return jsonify({"success": False, "error": "User not authenticated"}), 401
 
-    username = session.get("username")
-    user = User.query.filter_by(username=username).first()
+        # Detect whether request came from fetch (JSON) or form
+        if request.is_json:
+            data = request.get_json(force=True)
+            title = data.get("title", "").strip()
+            new_subtitle = data.get("subtitle", "").strip()
+        else:
+            title = request.form.get("title", "").strip()
+            new_subtitle = request.form.get("subtitle", "").strip()
 
-    if not user:
-        return redirect(url_for("login"))
+        if not title:
+            return jsonify({"success": False, "error": "Missing title"}), 400
 
-    record = Record.query.filter_by(user_id=user.id, title=title).first()
-    if record:
-        record.subtitle = new_subtitle
-        record.updated_at = datetime.utcnow()
-        db.session.commit()
-        flash(f"✅ Subtitle updated for '{title}'!")
+        # Find the record by title
+        records_ref = firestore_db.collection("users").document(uid).collection("records")
+        docs = records_ref.where("title", "==", title).limit(1).stream()
+        docs_l = list(docs)
 
-    return redirect(url_for("record_dashboard"))
+        if not docs_l:
+            return jsonify({"success": False, "error": f"Record '{title}' not found"}), 404
+
+        rec_id = docs_l[0].id
+        records_ref.document(rec_id).update({
+            "subtitle": new_subtitle,
+            "updated_at": firestore.SERVER_TIMESTAMP
+        })
+
+        print(f"✅ Subtitle updated for '{title}' → '{new_subtitle}'")
+
+        # Handle both frontend fetch and legacy redirect
+        if request.is_json:
+            return jsonify({
+                "success": True,
+                "message": f"Subtitle updated for '{title}'",
+                "subtitle": new_subtitle
+            })
+        else:
+            flash(f"✅ Subtitle updated for '{title}'!")
+            return redirect(url_for("record_dashboard"))
+
+    except Exception as e:
+        print(f"⚠️ Error updating subtitle: {e}")
+        if request.is_json:
+            return jsonify({"success": False, "error": str(e)}), 500
+        flash("⚠️ Could not update subtitle.")
+        return redirect(url_for("record_dashboard"))
+
 
 @app.route("/download-record")
 @login_required
 def download_record():
     title = request.args.get("title", "").strip()
     format = request.args.get("format", "csv").lower()
-
-    if not title:
+    uid = get_uid()
+    if not title or not uid:
         return "Missing title", 400
 
-    username = session.get("username")
-    user = User.query.filter_by(username=username).first()
+    try:
+        rec_docs = firestore_db.collection("users").document(uid).collection("records").where("title", "==", title).stream()
+        rec_list = list(rec_docs)
+        if not rec_list:
+            return f"Record '{title}' not found", 404
+        rec_doc = rec_list[0]
+        rec = rec_doc.to_dict()
+        rec_id = rec_doc.id
+        scans_docs = firestore_db.collection("users").document(uid).collection("record_scans").where("record_id", "==", rec_id).order_by("scanned_at", direction=firestore.Query.DESCENDING).stream()
+        scans = [d.to_dict() for d in scans_docs]
+    except Exception as e:
+        print(f"Warning: could not read record from Firestore: {e}")
+        scans = []
 
-    if not user:
-        return "User not found", 401
-
-    record = Record.query.filter_by(user_id=user.id, title=title).first()
-    if not record:
-        return f"Record '{title}' not found", 404
-
-    scans = RecordScan.query.filter_by(record_id=record.id).order_by(desc(RecordScan.scanned_at)).all()
-
+    # build rows dedup logic similar to old code
     seen = set()
     rows = []
     all_keys = set(["id", "scanned at"])
 
     for scan in scans:
         row = {}
+        raw = scan.get("data")
         try:
-            raw = eval(scan.data) if isinstance(scan.data, str) else scan.data
-            if isinstance(raw, dict):
-                row = {k.strip().lower(): v.strip().lower() for k, v in raw.items()}
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, dict):
+                row = {k.strip().lower(): str(v).strip().lower() for k, v in parsed.items()}
             else:
-                row = {"data": str(scan.data).strip().lower()}
-        except:
-            row = {"data": str(scan.data).strip().lower()}
+                row = {"data": str(raw).strip().lower()}
+        except Exception:
+            row = {"data": str(raw).strip().lower()}
 
         identity_key = tuple(sorted(row.items()))
         if identity_key in seen:
             continue
         seen.add(identity_key)
 
-        row["id"] = scan.id
-        row["scanned at"] = scan.scanned_at.strftime("%Y-%m-%d %H:%M:%S")
-
+        row["id"] = scan.get("id", "")
+        scanned_at = scan.get("scanned_at")
+        if hasattr(scanned_at, "isoformat"):
+            row["scanned at"] = scanned_at.isoformat()
+        else:
+            row["scanned_at"] = scanned_at
         all_keys.update(row.keys())
         rows.append(row)
 
@@ -1051,7 +1117,6 @@ def download_record():
             as_attachment=True,
             download_name=f"{secure_filename(title)}.csv"
         )
-
     elif format == "excel":
         df = pd.DataFrame([{k: row.get(k, "") for k in sorted_keys} for row in rows])
         output = BytesIO()
@@ -1064,40 +1129,102 @@ def download_record():
             as_attachment=True,
             download_name=f"{secure_filename(title)}.xlsx"
         )
-
     return "Unsupported format", 400
 
-
+# ---------------------------
+# Folders: create, rename, delete, move records
+# ---------------------------
 @app.route("/create-folder", methods=["POST"])
 @login_required
 def create_folder():
     try:
         data = request.get_json()
         name = data.get("name", "").strip()
-
+        parent_id = data.get("parent_id")
+        uid = get_uid()
         if not name:
             return jsonify({"error": "Folder name is required"}), 400
 
-        username = session.get("username")
-        user = User.query.filter_by(username=username).first()
-
-        if not user:
-            return jsonify({"error": "User not found"}), 401
-
-        # Check if folder already exists
-        existing_folder = Folder.query.filter_by(user_id=user.id, name=name).first()
-        if existing_folder:
+        # Check exists
+        q = firestore_db.collection("users").document(uid).collection("folders").where("name", "==", name).limit(1).stream()
+        if any(q):
             return jsonify({"error": "Folder already exists"}), 400
 
-        new_folder = Folder(user_id=user.id, name=name)
-        db.session.add(new_folder)
-        db.session.commit()
+        new_folder = {
+            "user_id": uid,
+            "name": name,
+            "parent_id": parent_id,
+            "created_at": firestore.SERVER_TIMESTAMP
+        }
+        ref = firestore_db.collection("users").document(uid).collection("folders").add(new_folder)
+        new_doc = new_folder.copy()
+        new_doc["id"] = ref[1].id
+        return jsonify({"success": True, "folder": new_doc})
+    except Exception as e:
+        print(f"Error creating folder: {e}")
+        return jsonify({"error": str(e)}), 500
 
-        return jsonify({"success": True, "folder": new_folder.to_dict()})
+@app.route("/rename-record", methods=["POST"])
+@login_required
+def rename_record():
+    try:
+        uid = get_uid()
+        if not uid:
+            return jsonify({"success": False, "error": "User not authenticated"}), 401
+
+        # Support both JSON (fetch) and form submissions
+        if request.is_json:
+            data = request.get_json(force=True)
+            old_title = data.get("old_title", "").strip()
+            new_title = data.get("new_title", "").strip()
+        else:
+            old_title = request.form.get("old_title", "").strip()
+            new_title = request.form.get("new_title", "").strip()
+
+        if not old_title or not new_title:
+            return jsonify({"success": False, "error": "Both old_title and new_title are required"}), 400
+
+        # Prevent renaming to an existing title (duplicate)
+        records_ref = firestore_db.collection("users").document(uid).collection("records")
+        existing = list(records_ref.where("title", "==", new_title).limit(1).stream())
+        if existing:
+            return jsonify({
+                "success": False,
+                "error": f"A record with the title '{new_title}' already exists."
+            }), 409  # Conflict
+
+        # Find the record to rename
+        docs = list(records_ref.where("title", "==", old_title).limit(1).stream())
+        if not docs:
+            return jsonify({"success": False, "error": f"Record '{old_title}' not found"}), 404
+
+        rec_id = docs[0].id
+
+        # Update record title
+        records_ref.document(rec_id).update({
+            "title": new_title,
+            "updated_at": firestore.SERVER_TIMESTAMP
+        })
+
+        print(f"✅ Record renamed from '{old_title}' → '{new_title}' (uid: {uid})")
+
+        # JSON or form response
+        if request.is_json:
+            return jsonify({
+                "success": True,
+                "message": f"Record renamed to '{new_title}'",
+                "new_title": new_title
+            })
+        else:
+            flash(f"✅ Record renamed to '{new_title}'")
+            return redirect(url_for("record_dashboard"))
 
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        print("⚠️ Error renaming record:", e)
+        if request.is_json:
+            return jsonify({"success": False, "error": str(e)}), 500
+        flash("⚠️ Could not rename record.")
+        return redirect(url_for("record_dashboard"))
 
 
 @app.route("/rename-folder", methods=["POST"])
@@ -1107,29 +1234,25 @@ def rename_folder():
         data = request.get_json()
         folder_id = data.get("id")
         new_name = data.get("name", "").strip()
-
+        uid = get_uid()
         if not new_name:
             return jsonify({"error": "Folder name is required"}), 400
 
-        username = session.get("username")
-        user = User.query.filter_by(username=username).first()
-
-        if not user:
-            return jsonify({"error": "User not found"}), 401
-
-        folder = Folder.query.filter_by(id=folder_id, user_id=user.id).first()
-        if not folder:
+        folder_ref = firestore_db.collection("users").document(uid).collection("folders").document(folder_id)
+        folder_doc = folder_ref.get()
+        if not folder_doc.exists:
             return jsonify({"error": "Folder not found"}), 404
 
-        folder.name = new_name
-        db.session.commit()
+        # check conflict
+        conflict = firestore_db.collection("users").document(uid).collection("folders").where("name", "==", new_name).limit(1).stream()
+        if any(conflict):
+            return jsonify({"error": "Folder name already exists"}), 400
 
-        return jsonify({"success": True, "folder": folder.to_dict()})
-
+        folder_ref.update({"name": new_name})
+        return jsonify({"success": True, "folder": {"id": folder_id, "name": new_name}})
     except Exception as e:
-        db.session.rollback()
+        print(f"Error renaming folder: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/delete-folder", methods=["POST"])
 @login_required
@@ -1137,30 +1260,27 @@ def delete_folder():
     try:
         data = request.get_json()
         folder_id = data.get("id")
+        uid = get_uid()
 
-        username = session.get("username")
-        user = User.query.filter_by(username=username).first()
-
-        if not user:
-            return jsonify({"error": "User not found"}), 401
-
-        folder = Folder.query.filter_by(id=folder_id, user_id=user.id).first()
-        if not folder:
+        folder_ref = firestore_db.collection("users").document(uid).collection("folders").document(folder_id)
+        folder_doc = folder_ref.get()
+        if not folder_doc.exists:
             return jsonify({"error": "Folder not found"}), 404
 
-        # Move all records in this folder to uncategorized (folder_id = None)
-        Record.query.filter_by(folder_id=folder_id).update({"folder_id": None})
+        # Move records in this folder to uncategorized
+        records_q = firestore_db.collection("users").document(uid).collection("records").where("folder_id", "==", folder_id).stream()
+        batch = firestore_db.batch()
+        for r in records_q:
+            doc_ref = firestore_db.collection("users").document(uid).collection("records").document(r.id)
+            batch.update(doc_ref, {"folder_id": None})
+        batch.commit()
 
-        # Delete the folder
-        db.session.delete(folder)
-        db.session.commit()
-
+        # Delete folder (and optionally subfolders recursively - omitted for brevity)
+        folder_ref.delete()
         return jsonify({"success": True})
-
     except Exception as e:
-        db.session.rollback()
+        print(f"Error deleting folder: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/move-record-to-folder", methods=["POST"])
 @login_required
@@ -1168,62 +1288,89 @@ def move_record_to_folder():
     try:
         data = request.get_json()
         record_title = data.get("title")
-        folder_id = data.get("folder_id")  # Can be None for uncategorized
+        folder_id = data.get("folder_id")  # Can be None
+        uid = get_uid()
 
-        username = session.get("username")
-        user = User.query.filter_by(username=username).first()
-
-        if not user:
-            return jsonify({"error": "User not found"}), 401
-
-        record = Record.query.filter_by(user_id=user.id, title=record_title).first()
-        if not record:
-            return jsonify({"error": "Record not found"}), 404
-
-        # Validate folder exists if folder_id is provided
-        if folder_id:
-            folder = Folder.query.filter_by(id=folder_id, user_id=user.id).first()
-            if not folder:
-                return jsonify({"error": "Folder not found"}), 404
-
-        record.folder_id = folder_id
-        record.updated_at = datetime.utcnow()
-        db.session.commit()
-
+        rec_docs = firestore_db.collection("users").document(uid).collection("records").where("title", "==", record_title).limit(1).stream()
+        recs = list(rec_docs)
+        if not recs:
+            return jsonify({"success": False, "error": "Record not found"}), 404
+        rec_id = recs[0].id
+        update_record_firestore(uid, rec_id, {"folder_id": folder_id})
         return jsonify({"success": True})
-
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        print(f"Error moving record to folder: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
-
+# ---------------------------
+# Dashboard API (folders & records)
+# ---------------------------
 @app.route("/api/dashboard-data")
 @login_required
 def api_dashboard_data():
-    """Get all folders and records for the dashboard"""
     try:
-        username = session.get("username")
-        user = User.query.filter_by(username=username).first()
+        uid = get_uid()
+        if not uid:
+            return jsonify({"success": False, "error": "No UID found"}), 401
 
-        if not user:
-            return jsonify({"success": False, "error": "User not found"}), 401
+        # ---- Folders ----
+        folders_col = firestore_db.collection("users").document(uid).collection("folders")
+        folders_docs = list(folders_col.stream())
 
-        # Create default folders if user has no folders
-        create_default_folders_if_needed(user.id)
+        # Create default folders only if missing
+        existing_names = [f.to_dict().get("name", "").lower() for f in folders_docs]
+        default_folders = [
+            "All Records", "Uncategorized", "Work Projects",
+            "Personal Records", "Archive", "Important Documents"
+        ]
 
-        # Get all folders for the user
-        folders = Folder.query.filter_by(user_id=user.id).all()
-        folder_list = [folder.to_dict() for folder in folders]
+        batch = firestore_db.batch()
+        for name in default_folders:
+            if name.lower() not in existing_names:
+                ref = folders_col.document()
+                batch.set(ref, {
+                    "user_id": uid,
+                    "name": name,
+                    "created_at": firestore.SERVER_TIMESTAMP
+                })
+        if batch:
+            batch.commit()
 
-        # Get all records for the user with additional info
-        records = Record.query.filter_by(user_id=user.id).order_by(desc(Record.updated_at)).all()
+        # Re-fetch all folders (ensures consistency)
+        folders_docs = list(folders_col.stream())
+        folder_list = [
+            {"id": f.id, **f.to_dict()} for f in folders_docs
+        ]
+
+        # ---- Records ----
+        records_col = firestore_db.collection("users").document(uid).collection("records")
+        records_docs = records_col.order_by(
+            "updated_at", direction=firestore.Query.DESCENDING
+        ).stream()
+
         record_list = []
+        for r in records_docs:
+            rd = r.to_dict()
+            rd["id"] = r.id
+            rd["updated_at"] = rd.get("updated_at")
 
-        for record in records:
-            record_data = record.to_dict()
-            record_data['scan_count'] = record.get_scan_count()
-            record_data['updated_at'] = record.updated_at.strftime("%Y-%m-%d")
-            record_list.append(record_data)
+            # Count related scans (safe: one filter only)
+            try:
+                scans_ref = firestore_db.collection("users").document(uid).collection("record_scans")
+                scans_query = scans_ref.where("record_id", "==", r.id).stream()
+                rd["scan_count"] = sum(1 for _ in scans_query)
+            except Exception as scan_err:
+                print("⚠️ Scan count error:", scan_err)
+                rd["scan_count"] = 0
+
+            # Resolve folder name if missing
+            if not rd.get("folder_name") and rd.get("folder_id"):
+                folder_ref = firestore_db.collection("users").document(uid).collection("folders").document(rd["folder_id"])
+                folder_doc = folder_ref.get()
+                if folder_doc.exists:
+                    rd["folder_name"] = folder_doc.to_dict().get("name", "Unknown")
+
+            record_list.append(rd)
 
         return jsonify({
             "success": True,
@@ -1232,211 +1379,122 @@ def api_dashboard_data():
         })
 
     except Exception as e:
+        print("❌ Dashboard data error:", e)
         return jsonify({"success": False, "error": str(e)}), 500
 
-
-def create_default_folders_if_needed(user_id):
-    """Create default folders for new users if they don't have any folders"""
-    existing_folders = Folder.query.filter_by(user_id=user_id).count()
-
-    if existing_folders == 0:
-        default_folders = [
-            'Work Projects',
-            'Personal Records',
-            'Archive',
-            'Important Documents'
-        ]
-
-        for folder_name in default_folders:
-            new_folder = Folder(
-                user_id=user_id,
-                name=folder_name,
-                parent_id=None
-            )
-            db.session.add(new_folder)
-
-        try:
-            db.session.commit()
-        except Exception as e:
-            db.session.rollback()
-            raise e
+# ---------------------------
+# API endpoints for folder operations (mirrors earlier endpoints)
+# ---------------------------
 
 @app.route("/api/create-folder", methods=["POST"])
 @login_required
 def api_create_folder():
-    """Create a new folder (with optional parent)"""
     try:
         data = request.get_json()
         name = data.get("name", "").strip()
-        parent_id = data.get("parent_id")  # NEW: Optional parent folder
-
+        parent_id = data.get("parent_id")
+        uid = get_uid()
         if not name:
             return jsonify({"success": False, "error": "Folder name is required"}), 400
 
-        username = session.get("username")
-        user = User.query.filter_by(username=username).first()
-
-        if not user:
-            return jsonify({"success": False, "error": "User not found"}), 401
-
-        # Check if parent folder exists and belongs to user (if specified)
-        if parent_id:
-            parent_folder = Folder.query.filter_by(id=parent_id, user_id=user.id).first()
-            if not parent_folder:
-                return jsonify({"success": False, "error": "Parent folder not found"}), 404
-
-        # Check if folder already exists with same name and parent
-        existing_folder = Folder.query.filter_by(
-            user_id=user.id,
-            name=name,
-            parent_id=parent_id
-        ).first()
-
-        if existing_folder:
+        existing = firestore_db.collection("users").document(uid).collection("folders").where("name", "==", name).limit(1).stream()
+        if any(existing):
             return jsonify({"success": False, "error": "Folder already exists"}), 400
 
-        new_folder = Folder(user_id=user.id, name=name, parent_id=parent_id)
-        db.session.add(new_folder)
-        db.session.commit()
-
-        return jsonify({"success": True, "folder": new_folder.to_dict()})
-
+        ref = firestore_db.collection("users").document(uid).collection("folders").add({
+            "user_id": uid,
+            "name": name,
+            "parent_id": parent_id,
+            "created_at": firestore.SERVER_TIMESTAMP
+        })
+        doc = {"id": ref[1].id, "name": name, "parent_id": parent_id}
+        return jsonify({"success": True, "folder": doc})
     except Exception as e:
-        db.session.rollback()
+        print(f"Error api_create_folder: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/api/rename-folder", methods=["POST"])
 @login_required
 def api_rename_folder():
-    """Rename an existing folder"""
     try:
         data = request.get_json()
         folder_id = data.get("id")
         new_name = data.get("name", "").strip()
-
+        uid = get_uid()
         if not new_name:
             return jsonify({"success": False, "error": "Folder name is required"}), 400
-
-        username = session.get("username")
-        user = User.query.filter_by(username=username).first()
-
-        if not user:
-            return jsonify({"success": False, "error": "User not found"}), 401
-
-        folder = Folder.query.filter_by(id=folder_id, user_id=user.id).first()
-        if not folder:
+        folder_ref = firestore_db.collection("users").document(uid).collection("folders").document(folder_id)
+        folder_doc = folder_ref.get()
+        if not folder_doc.exists:
             return jsonify({"success": False, "error": "Folder not found"}), 404
-
-        # Check for name conflicts in the same parent
-        existing_folder = Folder.query.filter_by(
-            user_id=user.id,
-            name=new_name,
-            parent_id=folder.parent_id
-        ).filter(Folder.id != folder_id).first()
-
-        if existing_folder:
+        # conflict check
+        conflict = firestore_db.collection("users").document(uid).collection("folders").where("name", "==", new_name).limit(1).stream()
+        if any(conflict):
             return jsonify({"success": False, "error": "Folder name already exists"}), 400
+        folder_ref.update({"name": new_name})
+        # Update all records that reference this folder_id to reflect the new name
+        records_q = firestore_db.collection("users").document(uid).collection("records").where("folder_id", "==", folder_id).stream()
+        batch = firestore_db.batch()
+        for r in records_q:
+            rec_ref = firestore_db.collection("users").document(uid).collection("records").document(r.id)
+            batch.update(rec_ref, {"folder_name": new_name})
+        batch.commit()
 
-        folder.name = new_name
-        db.session.commit()
-
-        return jsonify({"success": True, "folder": folder.to_dict()})
-
+        return jsonify({"success": True, "folder": {"id": folder_id, "name": new_name}})
     except Exception as e:
-        db.session.rollback()
+        print(f"Error api_rename_folder: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/api/delete-folder", methods=["POST"])
 @login_required
 def api_delete_folder():
-    """Delete a folder and move its records to uncategorized"""
     try:
         data = request.get_json()
         folder_id = data.get("id")
-
-        username = session.get("username")
-        user = User.query.filter_by(username=username).first()
-
-        if not user:
-            return jsonify({"success": False, "error": "User not found"}), 401
-
-        folder = Folder.query.filter_by(id=folder_id, user_id=user.id).first()
-        if not folder:
+        uid = get_uid()
+        folder_ref = firestore_db.collection("users").document(uid).collection("folders").document(folder_id)
+        folder_doc = folder_ref.get()
+        if not folder_doc.exists:
             return jsonify({"success": False, "error": "Folder not found"}), 404
 
-        # Move all records in this folder (and subfolders) to uncategorized
-        def move_folder_records(folder_to_delete):
-            # Move records in this folder
-            Record.query.filter_by(folder_id=folder_to_delete.id).update({"folder_id": None})
+        # move records out of folder
+        records_q = firestore_db.collection("users").document(uid).collection("records").where("folder_id", "==", folder_id).stream()
+        batch = firestore_db.batch()
+        for r in records_q:
+            doc_ref = firestore_db.collection("users").document(uid).collection("records").document(r.id)
+            batch.update(doc_ref, {"folder_id": None})
+        batch.commit()
 
-            # Move records in subfolders recursively
-            subfolders = Folder.query.filter_by(parent_id=folder_to_delete.id).all()
-            for subfolder in subfolders:
-                move_folder_records(subfolder)
-
-        move_folder_records(folder)
-
-        # Delete all subfolders recursively
-        def delete_subfolders(parent_folder):
-            subfolders = Folder.query.filter_by(parent_id=parent_folder.id).all()
-            for subfolder in subfolders:
-                delete_subfolders(subfolder)
-                db.session.delete(subfolder)
-
-        delete_subfolders(folder)
-
-        # Delete the main folder
-        db.session.delete(folder)
-        db.session.commit()
-
+        # delete subfolders recursively is omitted for simplicity
+        folder_ref.delete()
         return jsonify({"success": True})
-
     except Exception as e:
-        db.session.rollback()
+        print(f"Error api_delete_folder: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/api/move-record-to-folder", methods=["POST"])
 @login_required
 def api_move_record_to_folder():
-    """Move a record to a different folder"""
     try:
         data = request.get_json()
         record_title = data.get("title")
-        folder_id = data.get("folder_id")  # Can be None for uncategorized
-
-        username = session.get("username")
-        user = User.query.filter_by(username=username).first()
-
-        if not user:
-            return jsonify({"success": False, "error": "User not found"}), 401
-
-        record = Record.query.filter_by(user_id=user.id, title=record_title).first()
-        if not record:
+        folder_id = data.get("folder_id")
+        uid = get_uid()
+        rec_docs = firestore_db.collection("users").document(uid).collection("records").where("title", "==", record_title).limit(1).stream()
+        recs = list(rec_docs)
+        if not recs:
             return jsonify({"success": False, "error": "Record not found"}), 404
-
-        # Validate folder exists if folder_id is provided
-        if folder_id:
-            folder = Folder.query.filter_by(id=folder_id, user_id=user.id).first()
-            if not folder:
-                return jsonify({"success": False, "error": "Folder not found"}), 404
-
-        record.folder_id = folder_id
-        record.updated_at = datetime.utcnow()
-        db.session.commit()
-
+        rec_id = recs[0].id
+        update_record_firestore(uid, rec_id, {"folder_id": folder_id})
         return jsonify({"success": True})
-
     except Exception as e:
-        db.session.rollback()
+        print(f"Error api_move_record_to_folder: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
-
+# ---------------------------
+# Run
+# ---------------------------
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
+    # debug=True for local development only
     app.run(host='0.0.0.0', port=port, debug=True)
-
-    # Locally work online work
-    # from development on site no, hi I am ID

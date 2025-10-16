@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <title>Create QR Code</title>
@@ -13,22 +14,34 @@
             background-color: #111;
             color: #fff;
         }
+
         .animated-section {
             animation: fadeIn 0.5s ease-in-out;
         }
+
         @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
+
         pre.json-preview {
             background-color: #222;
             padding: 1rem;
             border-radius: 8px;
             overflow-x: auto;
         }
+
         .form-row-container {
             position: relative;
         }
+
         .delete-btn {
             position: absolute;
             top: 0;
@@ -39,9 +52,11 @@
             font-size: 1.2rem;
             display: none;
         }
+
         .form-row-container:hover .delete-btn {
             display: inline;
         }
+
         .file-upload-area {
             border: 2px dashed #555;
             border-radius: 8px;
@@ -50,39 +65,47 @@
             transition: all 0.3s ease;
             background-color: #222;
         }
+
         .file-upload-area:hover {
             border-color: #007bff;
             background-color: #333;
         }
+
         .file-upload-area.dragover {
             border-color: #28a745;
             background-color: #1a4a1a;
         }
+
         .file-info {
             background-color: #333;
             padding: 1rem;
             border-radius: 8px;
             margin-top: 1rem;
         }
+
         .qr-result {
             background-color: #222;
             padding: 2rem;
             border-radius: 8px;
             text-align: center;
         }
+
         .progress {
             height: 20px;
             background-color: #333;
         }
+
         .file-type-icon {
             font-size: 2rem;
             margin-bottom: 1rem;
         }
+
         .alert-custom {
             background-color: #2d3748;
             border: 1px solid #4a5568;
             color: #f7fafc;
         }
+
         .alert-success {
             background-color: #1a4a1a;
             border: 1px solid #28a745;
@@ -91,6 +114,7 @@
             border-radius: 8px;
             margin-top: 1rem;
         }
+
         .alert-danger {
             background-color: #4a1a1a;
             border: 1px solid #dc3545;
@@ -99,6 +123,7 @@
             border-radius: 8px;
             margin-top: 1rem;
         }
+
         .progress-bar {
             transition: width 0.3s ease;
             background-color: #007bff;
@@ -108,6 +133,7 @@
             align-items: center;
             justify-content: center;
         }
+
         .qr-canvas {
             border: 2px solid #444;
             border-radius: 8px;
@@ -116,6 +142,7 @@
         }
     </style>
 </head>
+
 <body class="p-5">
     <div class="container">
         <h1 class="mb-4 text-center">🛠️ Create QR Code</h1>
@@ -149,10 +176,12 @@
             <div id="form-fields">
                 <div class="form-row-container row g-2 mb-2">
                     <div class="col-md-5">
-                        <input type="text" class="form-control" placeholder="Label (e.g., Name)" name="label[]" value="name" required>
+                        <input type="text" class="form-control" placeholder="Label (e.g., Name)" name="label[]"
+                            value="name" required>
                     </div>
                     <div class="col-md-5">
-                        <input type="text" class="form-control" placeholder="Value (e.g., Dwight)" name="value[]" required>
+                        <input type="text" class="form-control" placeholder="Enter your name here" name="value[]"
+                            required>
                     </div>
                     <div class="col-md-2 d-flex align-items-center">
                         <button type="button" class="delete-btn" onclick="removeRow(this)">✖</button>
@@ -160,10 +189,12 @@
                 </div>
                 <div class="form-row-container row g-2 mb-2">
                     <div class="col-md-5">
-                        <input type="text" class="form-control" placeholder="Label (e.g., Email)" name="label[]" value="email" required>
+                        <input type="text" class="form-control" placeholder="Label (e.g., Mat Number)" name="label[]"
+                            value="mat_number" required>
                     </div>
                     <div class="col-md-5">
-                        <input type="text" class="form-control" placeholder="Value (e.g., user@mail.com)" name="value[]" required>
+                        <input type="text" class="form-control" placeholder="Enter your mat number here" name="value[]"
+                            required>
                     </div>
                     <div class="col-md-2 d-flex align-items-center">
                         <button type="button" class="delete-btn" onclick="removeRow(this)">✖</button>
@@ -227,4 +258,5 @@
     </div>
 
 </body>
+
 </html>

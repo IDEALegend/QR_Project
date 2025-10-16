@@ -161,10 +161,10 @@ function createFolderElement(folder, depth) {
                 <div class="dropdown">
                     <button class="btn btn-sm btn-link text-light p-0" data-bs-toggle="dropdown">⋮</button>
                     <ul class="dropdown-menu dropdown-menu-end">
-                        <li><button class="dropdown-item" onclick="createSubfolder(${folder.id})">➕ New Subfolder</button></li>
-                        <li><button class="dropdown-item text-warning" onclick="renameFolder(${folder.id}, '${folder.name}')">✏️ Rename</button></li>
+                        <li><button class="dropdown-item" onclick="createSubfolder('${folder.id}')">➕ New Subfolder</button></li>
+                        <li><button class="dropdown-item text-warning" onclick="renameFolder('${folder.id}', '${folder.name}')">✏️ Rename</button></li>
                         <li><hr class="dropdown-divider"></li>
-                        <li><button class="dropdown-item text-danger" onclick="deleteFolder(${folder.id}, '${folder.name}')">🗑 Delete</button></li>
+                        <li><button class="dropdown-item text-danger" onclick="deleteFolder('${folder.id}', '${folder.name}')">🗑 Delete</button></li>
                     </ul>
                 </div>
             </div>
@@ -490,18 +490,77 @@ function renameRecord(currentTitle) {
     const newTitle = prompt('Enter new title:', currentTitle);
     if (!newTitle || !newTitle.trim() || newTitle.trim() === currentTitle) return;
 
-    // You can implement this endpoint in your backend
-    alert('Rename record functionality can be implemented in the backend');
+    fetch('/rename-record', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            old_title: currentTitle,
+            new_title: newTitle.trim()
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert(`Record renamed to "${newTitle}"!`);
+            // Optional: update the UI immediately without reload
+            const recordCard = document.querySelector(`[data-record-title="${currentTitle}"]`);
+            if (recordCard) {
+                const titleElement = recordCard.querySelector('.record-title');
+                if (titleElement) titleElement.textContent = newTitle;
+                recordCard.dataset.recordTitle = newTitle; // update data attribute
+            } else {
+                location.reload(); // fallback if record not found in DOM
+            }
+        } else {
+            alert('Error renaming record: ' + (data.error || data.message));
+        }
+    })
+    .catch(error => {
+        console.error('Error renaming record:', error);
+        alert('Request failed. Please try again.');
+    });
 }
+
 
 // Edit subtitle (stub - you can implement this)
 function editSubtitle(recordTitle, currentSubtitle) {
     const newSubtitle = prompt('Enter new subtitle:', currentSubtitle);
     if (newSubtitle === null) return; // User cancelled
+    if (newSubtitle.trim() === currentSubtitle.trim()) return; // No change made
 
-    // You can implement this endpoint in your backend
-    alert('Edit subtitle functionality can be implemented in the backend');
+    fetch('/update-subtitle', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            title: recordTitle,
+            subtitle: newSubtitle.trim()
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert('Subtitle updated!');
+            // Optional: update the subtitle directly on the page without reload
+            const subtitleElement = document.querySelector(`[data-record-title="${recordTitle}"] .record-subtitle`);
+            if (subtitleElement) {
+                subtitleElement.textContent = newSubtitle;
+            } else {
+                location.reload(); // fallback if no element found
+            }
+        } else {
+            alert('Error updating subtitle: ' + (data.error || data.message));
+        }
+    })
+    .catch(error => {
+        console.error('Error updating subtitle:', error);
+        alert('Request failed. Please try again.');
+    });
 }
+
 
 // Mobile sidebar functions
 function toggleSidebar() {

@@ -1,3 +1,16 @@
+# Virtual environment
+.venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Firebase service account (keep this out of source control)
+serviceAccountKey.json
+qrpenguin-61677-firebase-adminsdk-fbsvc.json
+
+# Local files
+requirements-lock.txt
 # Byte-compiled / cache
 __pycache__/
 *.py[cod]
@@ -26,3 +39,13 @@ static/qr/qr_json/*.json
 # System
 .DS_Store
 Thumbs.db
+
+__pycache__/
+*.pyc
+uploads/
+static/qr/
+*.json
+.env
+migrations/backups/
+.vscode/
+.idea/
